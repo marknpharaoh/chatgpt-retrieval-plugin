@@ -24,5 +24,15 @@ idna
 itsdangerous
 jinja2
 packaging
-MarkupSafe
-Werkzeug
+werkzeug
+blinker
+urllib3
+jiter
+regex
+tenacity
+pymongo
+pandas
+numpy
+scipy
+PyYAML
+aiohttp
