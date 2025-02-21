@@ -38,6 +38,8 @@ loguru = "^0.7.0"
 elasticsearch = "8.8.2"
 pymongo = "^4.3.3"
 motor = "^3.3.2"
+langchain = "==0.0.148"
+
 
 [tool.poetry.scripts]
 start = "server.main:start"
