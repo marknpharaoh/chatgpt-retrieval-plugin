@@ -1,4 +1,5 @@
 import os
+import requests
 from typing import Optional
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Depends, Body, UploadFile
@@ -14,15 +15,22 @@ from models.api import (
     UpsertRequest,
     UpsertResponse,
 )
-from datastore.factory import get_datastore
-from services.file import get_document_from_file
-
 from models.models import DocumentMetadata, Source
 
+# Security for API requests
 bearer_scheme = HTTPBearer()
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN")
-assert BEARER_TOKEN is not None
+AIRTABLE_PAT = os.environ.get("AIRTABLE_PAT")
 
+assert BEARER_TOKEN is not None, "BEARER_TOKEN is not set"
+assert AIRTABLE_PAT is not None, "AIRTABLE_PAT is not set"
+
+AIRTABLE_META_URL = "https://api.airtable.com/v0/meta/bases"
+
+HEADERS = {
+    "Authorization": f"Bearer {AIRTABLE_PAT}",
+    "Content-Type": "application/json"
+}
 
 def validate_token(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     if credentials.scheme != "Bearer" or credentials.credentials != BEARER_TOKEN:
@@ -33,123 +41,120 @@ def validate_token(credentials: HTTPAuthorizationCredentials = Depends(bearer_sc
 app = FastAPI(dependencies=[Depends(validate_token)])
 app.mount("/.well-known", StaticFiles(directory=".well-known"), name="static")
 
-# Create a sub-application, in order to access just the query endpoint in an OpenAPI schema, found at http://0.0.0.0:8000/sub/openapi.json when the app is running locally
-sub_app = FastAPI(
-    title="Retrieval Plugin API",
-    description="A retrieval API for querying and filtering documents based on natural language queries and metadata",
-    version="1.0.0",
-    servers=[{"url": "https://your-app-url.com"}],
-    dependencies=[Depends(validate_token)],
-)
-app.mount("/sub", sub_app)
+
+def get_all_bases():
+    """ Fetch all bases the API key has access to """
+    response = requests.get(AIRTABLE_META_URL, headers=HEADERS)
+    response.raise_for_status()
+    return {base["id"]: base["name"] for base in response.json().get("bases", [])}
 
 
-@app.post(
-    "/upsert-file",
-    response_model=UpsertResponse,
-)
-async def upsert_file(
-    file: UploadFile = File(...),
-    metadata: Optional[str] = Form(None),
-):
-    try:
-        metadata_obj = (
-            DocumentMetadata.parse_raw(metadata)
-            if metadata
-            else DocumentMetadata(source=Source.file)
-        )
-    except:
-        metadata_obj = DocumentMetadata(source=Source.file)
-
-    document = await get_document_from_file(file, metadata_obj)
-
-    try:
-        ids = await datastore.upsert([document])
-        return UpsertResponse(ids=ids)
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail=f"str({e})")
+def get_all_tables(base_id):
+    """ Fetch all tables in a given base """
+    tables_url = f"https://api.airtable.com/v0/meta/bases/{base_id}/tables"
+    response = requests.get(tables_url, headers=HEADERS)
+    response.raise_for_status()
+    return {table["id"]: table["name"] for table in response.json().get("tables", [])}
 
 
-@app.post(
-    "/upsert",
-    response_model=UpsertResponse,
-)
-async def upsert(
-    request: UpsertRequest = Body(...),
-):
-    try:
-        ids = await datastore.upsert(request.documents)
-        return UpsertResponse(ids=ids)
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail="Internal Service Error")
+@app.post("/upsert", response_model=UpsertResponse)
+async def upsert(request: UpsertRequest = Body(...)):
+    """ Insert or update records in all Airtable tables """
+    bases = get_all_bases()
+    results = []
+
+    for base_id, base_name in bases.items():
+        tables = get_all_tables(base_id)
+
+        for table_id, table_name in tables.items():
+            airtable_url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
+
+            records = []
+            for doc in request.documents:
+                record = {
+                    "fields": {
+                        "DocumentID": doc.id,
+                        "Text": doc.text,
+                        "Metadata": str(doc.metadata.dict())
+                    }
+                }
+                records.append(record)
+
+            try:
+                response = requests.post(airtable_url, json={"records": records}, headers=HEADERS)
+                response.raise_for_status()
+                results.extend([r["id"] for r in response.json().get("records", [])])
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to upsert into {base_name} -> {table_name}: {e}")
+
+    return UpsertResponse(ids=results)
 
 
-@app.post(
-    "/query",
-    response_model=QueryResponse,
-)
-async def query_main(
-    request: QueryRequest = Body(...),
-):
-    try:
-        results = await datastore.query(
-            request.queries,
-        )
-        return QueryResponse(results=results)
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail="Internal Service Error")
+@app.post("/query", response_model=QueryResponse)
+async def query(request: QueryRequest = Body(...)):
+    """ Query all Airtable bases and tables """
+    bases = get_all_bases()
+    query_text = request.queries[0].query
+    results = []
+
+    for base_id, base_name in bases.items():
+        tables = get_all_tables(base_id)
+
+        for table_id, table_name in tables.items():
+            airtable_url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
+            
+            # 🔹 Change "Text" to the correct field name in your Airtable
+            FIELD_TO_SEARCH = "YourActualFieldNameHere"
+
+            try:
+                response = requests.get(
+                    airtable_url,
+                    headers=HEADERS,
+                    params={"filterByFormula": f"FIND('{query_text}', {{{FIELD_TO_SEARCH}}})"}
+                )
+                response.raise_for_status()
+                
+                for rec in response.json().get("records", []):
+                    results.append({
+                        "id": rec["id"],
+                        "text": rec["fields"].get(FIELD_TO_SEARCH, ""),
+                        "metadata": rec["fields"].get("Metadata", {})
+                    })
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Failed to query {base_name} -> {table_name}: {e}")
+
+    return QueryResponse(results=results)
 
 
-@sub_app.post(
-    "/query",
-    response_model=QueryResponse,
-    # NOTE: We are describing the shape of the API endpoint input due to a current limitation in parsing arrays of objects from OpenAPI schemas. This will not be necessary in the future.
-    description="Accepts search query objects array each with query and optional filter. Break down complex questions into sub-questions. Refine results by criteria, e.g. time / source, don't do this often. Split queries if ResponseTooLargeError occurs.",
-)
-async def query(
-    request: QueryRequest = Body(...),
-):
-    try:
-        results = await datastore.query(
-            request.queries,
-        )
-        return QueryResponse(results=results)
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail="Internal Service Error")
+@app.delete("/delete", response_model=DeleteResponse)
+async def delete(request: DeleteRequest = Body(...)):
+    """ Delete records from all Airtable bases/tables """
+    if not request.ids:
+        raise HTTPException(status_code=400, detail="Must provide record IDs to delete")
 
+    bases = get_all_bases()
+    deleted = 0
 
-@app.delete(
-    "/delete",
-    response_model=DeleteResponse,
-)
-async def delete(
-    request: DeleteRequest = Body(...),
-):
-    if not (request.ids or request.filter or request.delete_all):
-        raise HTTPException(
-            status_code=400,
-            detail="One of ids, filter, or delete_all is required",
-        )
-    try:
-        success = await datastore.delete(
-            ids=request.ids,
-            filter=request.filter,
-            delete_all=request.delete_all,
-        )
-        return DeleteResponse(success=success)
-    except Exception as e:
-        logger.error(e)
-        raise HTTPException(status_code=500, detail="Internal Service Error")
+    for base_id, base_name in bases.items():
+        tables = get_all_tables(base_id)
+
+        for table_id, table_name in tables.items():
+            for record_id in request.ids:
+                airtable_url = f"https://api.airtable.com/v0/{base_id}/{table_name}/{record_id}"
+                
+                try:
+                    response = requests.delete(airtable_url, headers=HEADERS)
+                    response.raise_for_status()
+                    deleted += 1
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Failed to delete from {base_name} -> {table_name}: {e}")
+
+    return DeleteResponse(success=deleted > 0)
 
 
 @app.on_event("startup")
 async def startup():
-    global datastore
-    datastore = await get_datastore()
+    logger.info("Airtable-backed Retrieval Plugin started")
 
 
 def start():
