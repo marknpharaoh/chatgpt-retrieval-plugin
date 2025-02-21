@@ -15,7 +15,6 @@ from models.api import (
     UpsertRequest,
     UpsertResponse,
 )
-from models.models import DocumentMetadata, Source
 
 # Security for API requests
 bearer_scheme = HTTPBearer()
@@ -41,13 +40,11 @@ def validate_token(credentials: HTTPAuthorizationCredentials = Depends(bearer_sc
 app = FastAPI(dependencies=[Depends(validate_token)])
 app.mount("/.well-known", StaticFiles(directory=".well-known"), name="static")
 
-
 def get_all_bases():
     """ Fetch all bases the API key has access to """
     response = requests.get(AIRTABLE_META_URL, headers=HEADERS)
     response.raise_for_status()
     return {base["id"]: base["name"] for base in response.json().get("bases", [])}
-
 
 def get_all_tables(base_id):
     """ Fetch all tables in a given base """
@@ -56,43 +53,19 @@ def get_all_tables(base_id):
     response.raise_for_status()
     return {table["id"]: table["name"] for table in response.json().get("tables", [])}
 
-
-@app.post("/upsert", response_model=UpsertResponse)
-async def upsert(request: UpsertRequest = Body(...)):
-    """ Insert or update records in all Airtable tables """
-    bases = get_all_bases()
-    results = []
-
-    for base_id, base_name in bases.items():
-        tables = get_all_tables(base_id)
-
-        for table_id, table_name in tables.items():
-            airtable_url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
-
-            records = []
-            for doc in request.documents:
-                record = {
-                    "fields": {
-                        "DocumentID": doc.id,
-                        "Text": doc.text,
-                        "Metadata": str(doc.metadata.dict())
-                    }
-                }
-                records.append(record)
-
-            try:
-                response = requests.post(airtable_url, json={"records": records}, headers=HEADERS)
-                response.raise_for_status()
-                results.extend([r["id"] for r in response.json().get("records", [])])
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Failed to upsert into {base_name} -> {table_name}: {e}")
-
-    return UpsertResponse(ids=results)
-
+def get_all_fields(base_id, table_name):
+    """ Fetch all field names dynamically for a given table """
+    airtable_url = f"https://api.airtable.com/v0/{base_id}/{table_name}?maxRecords=1"
+    response = requests.get(airtable_url, headers=HEADERS)
+    response.raise_for_status()
+    records = response.json().get("records", [])
+    if records:
+        return list(records[0].get("fields", {}).keys())  # Extract field names
+    return []
 
 @app.post("/query", response_model=QueryResponse)
 async def query(request: QueryRequest = Body(...)):
-    """ Query all Airtable bases and tables """
+    """ Query all Airtable bases and tables dynamically across all fields """
     bases = get_all_bases()
     query_text = request.queries[0].query
     results = []
@@ -101,55 +74,32 @@ async def query(request: QueryRequest = Body(...)):
         tables = get_all_tables(base_id)
 
         for table_id, table_name in tables.items():
+            fields = get_all_fields(base_id, table_name)  # Dynamically get fields
+
+            if not fields:
+                continue  # Skip tables with no fields
+
+            # Constructing OR condition to search across all fields
+            filter_formula = "OR(" + ",".join(
+                [f"FIND('{query_text}', {{{field}}})" for field in fields]
+            ) + ")"
+
             airtable_url = f"https://api.airtable.com/v0/{base_id}/{table_name}"
             
-            # 🔹 Change "Text" to the correct field name in your Airtable
-            FIELD_TO_SEARCH = "YourActualFieldNameHere"
-
             try:
-                response = requests.get(
-                    airtable_url,
-                    headers=HEADERS,
-                    params={"filterByFormula": f"FIND('{query_text}', {{{FIELD_TO_SEARCH}}})"}
-                )
+                response = requests.get(airtable_url, headers=HEADERS, params={"filterByFormula": filter_formula})
                 response.raise_for_status()
                 
                 for rec in response.json().get("records", []):
                     results.append({
                         "id": rec["id"],
-                        "text": rec["fields"].get(FIELD_TO_SEARCH, ""),
-                        "metadata": rec["fields"].get("Metadata", {})
+                        "table": table_name,
+                        "fields": rec["fields"],  # Return all fields
                     })
             except requests.exceptions.RequestException as e:
                 logger.error(f"Failed to query {base_name} -> {table_name}: {e}")
 
     return QueryResponse(results=results)
-
-
-@app.delete("/delete", response_model=DeleteResponse)
-async def delete(request: DeleteRequest = Body(...)):
-    """ Delete records from all Airtable bases/tables """
-    if not request.ids:
-        raise HTTPException(status_code=400, detail="Must provide record IDs to delete")
-
-    bases = get_all_bases()
-    deleted = 0
-
-    for base_id, base_name in bases.items():
-        tables = get_all_tables(base_id)
-
-        for table_id, table_name in tables.items():
-            for record_id in request.ids:
-                airtable_url = f"https://api.airtable.com/v0/{base_id}/{table_name}/{record_id}"
-                
-                try:
-                    response = requests.delete(airtable_url, headers=HEADERS)
-                    response.raise_for_status()
-                    deleted += 1
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Failed to delete from {base_name} -> {table_name}: {e}")
-
-    return DeleteResponse(success=deleted > 0)
 
 
 @app.on_event("startup")
